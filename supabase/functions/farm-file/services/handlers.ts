@@ -34,21 +34,17 @@ function createErrorResponse(c: Context, status: 400 | 401 | 413 | 415 | 500, me
  * @returns 响应
  */
 
-// 导出请求参数验证schema
-const exportSchema = z.object({
-  page: z.number().min(1).optional().default(1),
-  limit: z.number().min(0).optional().default(0)
-});
+
 
 export const exportFarms = withErrorHandling(async function exportFarms(c: Context) {
   // 获取JWT token（由中间件验证，这里只获取用于数据库操作）
   const token = getTokenFromHeader(c);
   
-  // 验证请求体格式
-  const body = await c.req.json().catch(() => { throw new Error('请求体格式错误，必须是有效的JSON'); });
+  // 验证请求体格式，支持空请求体（默认全量导出）
+  const body = await c.req.json().catch(() => ({}));
   
-  // 验证请求参数
-  const { page, limit } = exportSchema.parse(body);
+  // 验证请求参数，使用默认值
+  const { page = 1, limit = 0 } = body;
   
   // 为导出功能设置默认限制，防止内存溢出
   // 当limit=0时，保持无限制导出
