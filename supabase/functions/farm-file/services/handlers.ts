@@ -36,6 +36,12 @@ function createErrorResponse(c: Context, status: 400 | 401 | 413 | 415 | 500, me
 
 
 
+// 导出请求参数验证schema
+const exportSchema = z.object({
+  page: z.number().min(1).optional().default(1),
+  limit: z.number().min(0).optional().default(0)
+});
+
 export const exportFarms = withErrorHandling(async function exportFarms(c: Context) {
   // 获取JWT token（由中间件验证，这里只获取用于数据库操作）
   const token = getTokenFromHeader(c);
@@ -43,8 +49,8 @@ export const exportFarms = withErrorHandling(async function exportFarms(c: Conte
   // 验证请求体格式，支持空请求体（默认全量导出）
   const body = await c.req.json().catch(() => ({}));
   
-  // 验证请求参数，使用默认值
-  const { page = 1, limit = 0 } = body;
+  // 使用zod验证请求参数，获取默认值
+  const { page, limit } = exportSchema.parse(body);
   
   // 为导出功能设置默认限制，防止内存溢出
   // 当limit=0时，保持无限制导出
@@ -185,29 +191,18 @@ export const importFarms = withErrorHandling(async function importFarms(c: Conte
  * @param c Hono 上下文
  * @returns 响应
  */
+// 生成预签名URL请求参数验证schema
+const generateUploadUrlSchema = z.object({
+  fileName: z.string().min(1, 'fileName必须是非空字符串').max(255, 'fileName长度不能超过255个字符'),
+  fileType: z.string().min(1, 'fileType必须是非空字符串')
+});
+
 export const generateUploadUrl = withErrorHandling(async function generateUploadUrl(c: Context) {
   // 解析请求参数
   const body = await c.req.json();
-  const { fileName, fileType } = body;
-
-  // 验证必填参数
-  if (!fileName || !fileType) {
-    return createErrorResponse(c, 400, 'fileName和fileType为必填参数');
-  }
-
-  // 验证fileName格式
-  if (typeof fileName !== 'string' || fileName.trim() === '') {
-    return createErrorResponse(c, 400, 'fileName必须是非空字符串');
-  }
-
-  if (fileName.length > 255) {
-    return createErrorResponse(c, 400, 'fileName长度不能超过255个字符');
-  }
-
-  // 验证fileType格式
-  if (typeof fileType !== 'string' || fileType.trim() === '') {
-    return createErrorResponse(c, 400, 'fileType必须是非空字符串');
-  }
+  
+  // 使用zod验证请求参数
+  const { fileName, fileType } = generateUploadUrlSchema.parse(body);
 
   // 验证文件类型
   if (!ALLOWED_MIME_TYPES.includes(fileType)) {
