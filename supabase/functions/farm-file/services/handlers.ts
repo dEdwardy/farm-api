@@ -1,4 +1,5 @@
-import { Hono } from 'npm:hono@^4.12.5';
+import type { Context } from 'npm:hono@^4.12.5';
+import { z } from 'npm:zod@^4.3.6';
 import { Farm, ImportResult } from './types.ts';
 import { generateExcel, generateTimestamp, parseExcel } from './excel.ts';
 import { matchHeaders, checkRequiredFields, identifyExtraFields } from './header-matching.ts';
@@ -6,235 +7,223 @@ import { validateFarms, processBooleanValue, processStringValue } from './valida
 import { getAllFarms, batchInsertFarms, getColumnInfo } from './database.ts';
 import { MAX_FILE_SIZE, MAX_IMPORT_RECORDS } from './constants.ts';
 import { generatePresignedUrl, ALLOWED_MIME_TYPES } from './oss.ts';
+import { withErrorHandling } from './middleware/error.ts';
+import { getTokenFromHeader } from './utils.ts';
+
+/**
+ * 创建统一的错误响应
+ * @param c Hono 上下文
+ * @param status 状态码
+ * @param message 错误信息
+ * @param error 详细错误信息
+ * @returns 错误响应
+ */
+function createErrorResponse(c: Context, status: 400 | 401 | 413 | 415 | 500, message: string, error?: string) {
+  return c.json({
+    success: false,
+    message,
+    error
+  }, status);
+}
+
+
 
 /**
  * 导出养殖场数据为Excel文件
  * @param c Hono 上下文
  * @returns 响应
  */
-export async function exportFarms(c: any) {
-  try {
-    // 从请求头获取JWT token
-    const authHeader = c.req.header('Authorization');
-    const token = authHeader?.replace('Bearer ', '') || '';
-    
-    if (!token) {
-      return c.json({
-        success: false,
-        message: '缺少认证token'
-      }, 401);
-    }
-    
-    // 获取所有养殖场数据
-    const farms = await getAllFarms(token);
-    
-    // 生成Excel文件
-    const excelData = generateExcel(farms);
-    console.log('excelData', excelData);
-    // 生成文件名
-    const timestamp = generateTimestamp();
-    const fileName = `Farm_Export_${timestamp}.xlsx`;
-    
-    // 设置响应头
-    c.header('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-    c.header('Content-Disposition', `attachment; filename="${fileName}"`);
-    c.header('Content-Length', excelData.length);
-    
-    // 返回Excel文件
-    return c.body(excelData);
-  } catch (error) {
-    console.error('导出失败:', error);
-    return c.json({
-      success: false,
-      message: '导出失败',
-      error: error instanceof Error ? error.message : String(error)
-    }, 500);
-  }
-}
+
+// 导出请求参数验证schema
+const exportSchema = z.object({
+  page: z.number().min(1).optional().default(1),
+  limit: z.number().min(0).optional().default(0)
+});
+
+export const exportFarms = withErrorHandling(async function exportFarms(c: Context) {
+  // 获取JWT token（由中间件验证，这里只获取用于数据库操作）
+  const token = getTokenFromHeader(c);
+  
+  // 验证请求体格式
+  const body = await c.req.json().catch(() => { throw new Error('请求体格式错误，必须是有效的JSON'); });
+  
+  // 验证请求参数
+  const { page, limit } = exportSchema.parse(body);
+  
+  // 为导出功能设置默认限制，防止内存溢出
+  // 当limit=0时，保持无限制导出
+  const exportLimit = limit > 0 ? Math.min(limit, 1000) : 0;
+  
+  // 获取养殖场数据
+  const farms = await getAllFarms(token, page, exportLimit);
+  
+  // 生成Excel文件
+  const excelData = generateExcel(farms);
+  
+  // 生成文件名
+  const timestamp = generateTimestamp();
+  const fileName = `Farm_Export_${timestamp}.xlsx`;
+  
+  // 设置响应头
+  c.header('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+  c.header('Content-Disposition', `attachment; filename="${fileName}"`);
+  c.header('Content-Length', String(excelData.byteLength));
+  c.header('Cache-Control', 'no-store');
+  // 返回Excel文件
+  return c.body(excelData as any);
+});
 
 /**
  * 导入养殖场数据
  * @param c Hono 上下文
  * @returns 响应
  */
-export async function importFarms(c: any) {
-  try {
-    // 获取上传的文件
-    const formData = await c.req.formData();
-    const file = formData.get('file') as File;
-    
-    if (!file) {
-      return c.json({
-        success: false,
-        message: '请上传Excel文件'
-      }, 400);
-    }
-    
-    // 检查文件大小
-    if (file.size > MAX_FILE_SIZE) {
-      return c.json({
-        success: false,
-        message: '文件大小不能超过10MB'
-      }, 413);
-    }
-    
-    // 检查文件类型
-    const fileName = file.name.toLowerCase();
-    if (!fileName.endsWith('.xlsx') && !fileName.endsWith('.xls')) {
-      return c.json({
-        success: false,
-        message: '只支持.xlsx和.xls格式的Excel文件'
-      }, 415);
-    }
-    
-    // 读取文件内容
-    const buffer = await file.arrayBuffer();
-    
-    // 解析Excel文件
-    const excelData = parseExcel(buffer);
-    
-    if (excelData.length < 2) {
-      return c.json({
-        success: false,
-        message: 'Excel文件中没有数据'
-      }, 400);
-    }
-    
-    // 获取表头
-    const headers = excelData[0] as string[];
-    
-    // 从请求头获取JWT token
-    const authHeader = c.req.header('Authorization');
-    const token = authHeader?.replace('Bearer ', '') || '';
-    
-    if (!token) {
-      return c.json({
-        success: false,
-        message: '缺少认证token'
-      }, 401);
-    }
-    
-    // 获取列信息
-    const columns = await getColumnInfo(token);
-    
-    // 智能匹配表头
-    const mappedHeaders = matchHeaders(headers, columns);
-     
-    // 检查是否缺少必要字段
-    const missingFields = checkRequiredFields(mappedHeaders);
-    if (missingFields.length > 0) {
-    return c.json({
-        success: false,
-      message: `缺少必要字段：${missingFields.join(', ')}`
-      }, 400);
-    }
-    
-    // 识别多余字段
-    const extraFields  = identifyExtraFields(headers, mappedHeaders);
-    const warnings = extraFields.map(field => `忽略多余字段：${field}`);
+export const importFarms = withErrorHandling(async function importFarms(c: Context) {
+  // 获取JWT token（由中间件验证，这里只获取用于数据库操作）
+  const token = getTokenFromHeader(c);
   
-    // 解析数据
-    const dataRows = excelData.slice(1);
-    const farms: Partial<Farm>[] = [];
+  // 获取上传的文件
+  const formData = await c.req.formData();
+  const file = formData.get('file') as File;
   
-    dataRows.forEach((row, index) => {
-      const farm: Partial<Farm> = {};
-      
-    headers.forEach((header, colIndex) => {
-        const field = mappedHeaders[header.trim()];
-        if (field) {
-          const value = row[colIndex];
-          
-          // 处理字段类型
-          if (field === 'has_treatment_facility') {
-            (farm as any)[field] = processBooleanValue(value);
-          } else {
-            (farm as any)[field] = processStringValue(value);
-          }
-      }
-      });
-      
-      farms.push(farm);
-    });
-     
-    // 验证数据
-    const { validFarms, errors } = validateFarms(farms);
-    
-    // 检查记录数限制
-    if (farms.length > MAX_IMPORT_RECORDS) {
-      return c.json({
-        success: false,
-      message: '单次导入最多支持1000条记录'
-      }, 400);
-    }
-  
-    // 批量插入数据
-    let successCount = 0;
-    if (validFarms.length > 0) {
-      successCount = await batchInsertFarms(validFarms, token);
-    }
-    
-    // 构建导入结果
-    const result: ImportResult = {
-    success: errors.length === 0,
-      message: errors.length === 0 ? '导入成功' : '部分数据导入失败',
-      data: {
-        total: farms.length,
-        successCount,
-        failCount: errors.length,
-        errors,
-      warnings
-      }
-    };
-    
-    return c.json(result, 200);
-  } catch (error) { 
-    console.error('导入失败:', error);
-    return c.json({
-      success: false,
-      message: '导入失败',
-      error: error instanceof Error ? error.message : String(error)
-    }, 500);
+  if (!file) {
+    return createErrorResponse(c, 400, '请上传Excel文件');
   }
-}
+  
+  // 检查文件大小
+  if (file.size > MAX_FILE_SIZE) {
+    return createErrorResponse(c, 413, '文件大小不能超过10MB');
+  }
+  
+  // 检查文件类型
+  const fileName = file.name.toLowerCase();
+  if (!fileName.endsWith('.xlsx') && !fileName.endsWith('.xls')) {
+    return createErrorResponse(c, 415, '只支持.xlsx和.xls格式的Excel文件');
+  }
+  
+  // 读取文件内容
+  const buffer = await file.arrayBuffer();
+  
+  // 解析Excel文件
+  const excelData = parseExcel(buffer);
+  
+  if (excelData.length < 2) {
+    return createErrorResponse(c, 400, 'Excel文件中没有数据');
+  }
+  
+  // 检查记录数限制（提前检查，避免不必要的处理）
+  if (excelData.length - 1 > MAX_IMPORT_RECORDS) {
+    return createErrorResponse(c, 400, '单次导入最多支持1000条记录');
+  }
+  
+  // 获取表头
+  const headers = excelData[0] as string[];
+  
+  // 获取列信息
+  const columns = getColumnInfo();
+  
+  // 智能匹配表头
+  const mappedHeaders = matchHeaders(headers, columns);
+   
+  // 检查是否缺少必要字段
+  const missingFields = checkRequiredFields(mappedHeaders);
+  if (missingFields.length > 0) {
+    return createErrorResponse(c, 400, `缺少必要字段：${missingFields.join(', ')}`);
+  }
+  
+  // 识别多余字段
+  const extraFields = identifyExtraFields(headers, mappedHeaders);
+  const warnings = extraFields.map(field => `忽略多余字段：${field}`);
+
+  // 解析数据
+  const dataRows = excelData.slice(1);
+  const farms: Partial<Farm>[] = [];
+
+  dataRows.forEach((row, index) => {
+    const farm: Partial<Farm> = {};
+    
+    headers.forEach((header, colIndex) => {
+      const field = mappedHeaders[header.trim()];
+      if (field) {
+        const value = row[colIndex];
+        
+        // 处理字段类型
+        if (field === 'has_treatment_facility') {
+          (farm as any)[field] = processBooleanValue(value);
+        } else {
+          (farm as any)[field] = processStringValue(value);
+        }
+      }
+    });
+    
+    farms.push(farm);
+  });
+   
+  // 验证数据
+  const { validFarms, errors } = validateFarms(farms);
+
+  // 批量插入数据
+  let successCount = 0;
+  if (validFarms.length > 0) {
+    successCount = await batchInsertFarms(validFarms, token);
+  }
+  
+  // 构建导入结果
+  const result: ImportResult = {
+    success: errors.length === 0,
+    message: errors.length === 0 ? '导入成功' : '部分数据导入失败',
+    data: {
+      total: farms.length,
+      successCount,
+      failCount: errors.length,
+      errors,
+      warnings
+    }
+  };
+  
+  return c.json(result, 200);
+});
 
 /**
  * 生成 OSS 上传预签名 URL
  * @param c Hono 上下文
  * @returns 响应
  */
-export async function generateUploadUrl(c: any) {
-  try {
-    // 解析请求参数
-    const { fileName, fileType } = await c.req.json();
+export const generateUploadUrl = withErrorHandling(async function generateUploadUrl(c: Context) {
+  // 解析请求参数
+  const body = await c.req.json();
+  const { fileName, fileType } = body;
 
-    // 验证必填参数
-    if (!fileName || !fileType) {
-      return c.json({
-        error: "fileName and fileType are required"
-      }, 400);
-    }
-
-    // 验证文件类型
-    if (!ALLOWED_MIME_TYPES.includes(fileType)) {
-      return c.json({ 
-        error: "File type not allowed",
-        allowedTypes: ALLOWED_MIME_TYPES 
-      }, 400);
-    }
-
-    // 生成预签名 URL
-    const result = await generatePresignedUrl(fileName, fileType);
-
-    // 返回响应
-    return c.json({
-      ...result,
-      expires: 3600
-    }, 200);
-  } catch (error) {
-    console.error("Error generating upload URL:", error);
-    return c.json({ 
-      error: error instanceof Error ? error.message : "Internal server error"
-    }, 500);
+  // 验证必填参数
+  if (!fileName || !fileType) {
+    return createErrorResponse(c, 400, 'fileName和fileType为必填参数');
   }
-}
+
+  // 验证fileName格式
+  if (typeof fileName !== 'string' || fileName.trim() === '') {
+    return createErrorResponse(c, 400, 'fileName必须是非空字符串');
+  }
+
+  if (fileName.length > 255) {
+    return createErrorResponse(c, 400, 'fileName长度不能超过255个字符');
+  }
+
+  // 验证fileType格式
+  if (typeof fileType !== 'string' || fileType.trim() === '') {
+    return createErrorResponse(c, 400, 'fileType必须是非空字符串');
+  }
+
+  // 验证文件类型
+  if (!ALLOWED_MIME_TYPES.includes(fileType)) {
+    return createErrorResponse(c, 400, `文件类型不允许，支持的类型：${ALLOWED_MIME_TYPES.join(', ')}`);
+  }
+
+  // 生成预签名 URL
+  const result = await generatePresignedUrl(fileName, fileType);
+
+  // 返回响应
+  return c.json({
+    ...result,
+    expires: 3600
+  }, 200);
+});

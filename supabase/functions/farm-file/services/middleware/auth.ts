@@ -1,4 +1,6 @@
+import type { Context } from 'npm:hono@^4.12.5';
 import { createClient } from "npm:@supabase/supabase-js@^2.39.0";
+import { getTokenFromHeader } from '../utils.ts';
 
 /**
  * JWT 验证中间件
@@ -6,15 +8,13 @@ import { createClient } from "npm:@supabase/supabase-js@^2.39.0";
  * @param next 下一个中间件
  * @returns 响应
  */
-export async function jwtAuthMiddleware (c: any, next: () => Promise<void>) {
+export async function jwtAuthMiddleware (c: Context, next: () => Promise<void>) {
   try {
-    const authHeader = c.req.header("Authorization");
-    if (!authHeader) {
+    const token = getTokenFromHeader(c);
+    if (!token) {
       return c.json({ error: "Authorization header is required" }, 401);
     }
-
-    const token = authHeader.replace("Bearer ", "");
-    console.log('req header token:', token);
+    
     // 创建带有 token 的 Supabase 客户端
     const supabase = createClient(
       Deno.env.get('SUPABASE_URL')!,

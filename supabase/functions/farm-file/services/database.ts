@@ -66,17 +66,27 @@ function transformFarmForInsert(farm: Farm): Record<string, unknown> {
 }
 
 /**
- * 获取所有养殖场数据
+ * 获取养殖场数据
  * @param token JWT token
+ * @param page 页码，默认1
+ * @param limit 每页数量，默认0（导出全量）
  * @returns 养殖场数据列表
  */
-export async function getAllFarms(token: string) {
+export async function getAllFarms(token: string, page: number = 1, limit: number = 0) {
   const supabase = createSupabaseClient(token);
   
-  const { data, error } = await supabase
+  let query = supabase
     .from('aquaculture_farms')
     .select('*')
     .is('deleted_at', null);
+  
+  // 如果limit大于0，则添加分页
+  if (limit > 0) {
+    const offset = (page - 1) * limit;
+    query = query.range(offset, offset + limit - 1);
+  }
+  
+  const { data, error } = await query;
   
   if (error) {
     throw new Error(`查询数据失败: ${error.message}`);
@@ -111,10 +121,9 @@ export async function batchInsertFarms(farms: Farm[], token: string) {
 
 /**
  * 获取列信息
- * @param token JWT token
  * @returns 列信息列表
  */
-export async function getColumnInfo(token: string): Promise<ColumnInfo[]> {
+export function getColumnInfo(): ColumnInfo[] {
   // 由于无法直接从数据库获取列注释，我们使用硬编码的列注释映射
   // 在实际项目中，可以考虑从数据库元数据中获取
   return Object.keys(columnComments).map(columnName => ({
